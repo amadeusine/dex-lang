@@ -32,23 +32,21 @@ import Util
 type SimplifyM = SubstBuilder
 
 simplifyModule :: Bindings -> Module -> Module
-simplifyModule scope (Module Core decls bindings) = do
-  let simpDecls = snd $ snd $ runSubstBuilder (simplifyDecls decls) scope
-  -- We don't have to check that the binders are global here, since all local
-  -- Atom binders have been inlined as part of the simplification.
-  let isAtomDecl decl = case decl of Let _ _ (Atom _) -> True; _ -> False
-  let (declsDone, declsNotDone) = partition isAtomDecl $ toList simpDecls
-  let bindings' = foldMap boundVars declsDone
-  Module Simp (toNest declsNotDone) (bindings <> bindings')
+simplifyModule scope (Module Core decls result) = let
+  (result', (_, decls')) =
+      runSubstBuilder scope mempty do
+        env <- simplifyDecls decls
+        extendR env $ substBuilderR result
+  in Module Simp decls' result'
 simplifyModule _ (Module ir _ _) = error $ "Expected Core, got: " ++ show ir
 
 splitSimpModule :: Bindings -> Module -> (Block, Abs Binder Module)
 splitSimpModule scope m = do
   let (Module Simp decls bindings) = hoistDepDataCons scope m
-  let localVars = filter (not . isGlobal) $ bindingsAsVars $ freeVars bindings
-  let block = Block decls $ Atom $ mkConsList $ map Var localVars
+  let localVars = bindingsAsVars $ boundVars decls
+  let block = Block decls $ Atom $ TupleVal $ map Var localVars
   let (Abs b (decls', bindings')) =
-        fst $ flip runBuilder scope $ buildAbs (Bind ("result":>getType block)) $
+        fst $ runBuilder scope mempty $ buildAbs (Bind ("result":>getType block)) $
           \result -> do
              results <- unpackConsList result
              substBuilder (newEnv localVars results) bindings
@@ -58,17 +56,19 @@ splitSimpModule scope m = do
 -- `AsList n xs` doesn't give us a well typed term. This is a short-term
 -- workaround.
 hoistDepDataCons :: Bindings -> Module -> Module
-hoistDepDataCons scope (Module Simp decls bindings) =
-  Module Simp decls' bindings'
-  where
-    (bindings', (_, decls')) = flip runBuilder scope $ do
-      mapM_ emitDecl decls
-      forM bindings \(ty, info) -> case info of
-        LetBound ann x | isData ty -> do x' <- emit x
-                                         return (ty, LetBound ann $ Atom x')
-        _ -> return (ty, info)
-hoistDepDataCons _ (Module _ _ _) =
-  error "Should only be hoisting data cons on core-Simp IR"
+hoistDepDataCons _ = id
+-- hoistDepDataCons = undefined
+-- hoistDepDataCons scope (Module Simp decls bindings) =
+--   Module Simp decls' bindings'
+--   where
+--     (bindings', (_, decls')) = flip runBuilder scope $ do
+--       mapM_ emitDecl decls
+--       forM bindings \(ty, info) -> case info of
+--         LetBound ann x | isData ty -> do x' <- emit x
+--                                          return (ty, LetBound ann $ Atom x')
+--         _ -> return (ty, info)
+-- hoistDepDataCons _ (Module _ _ _) =
+--   error "Should only be hoisting data cons on core-Simp IR"
 
 simplifyDecls :: Nest Decl -> SimplifyM SubstEnv
 simplifyDecls Empty = return mempty
@@ -80,13 +80,10 @@ simplifyDecls (Nest decl rest) = do
 simplifyDecl :: Decl -> SimplifyM SubstEnv
 simplifyDecl (Let NoInlineLet (Bind (name:>_)) expr) = do
   x <- simplifyStandalone expr
-  emitTo name NoInlineLet (Atom x) $> mempty
-simplifyDecl (Let ann b expr) = do
+  withNameHint name $ emitAnn NoInlineLet (Atom x) $> mempty
+simplifyDecl (Let _ b expr) = do
   x <- simplifyExpr expr
-  let name = binderNameHint b
-  if isGlobalBinder b
-    then emitTo name ann (Atom x) $> mempty
-    else return $ b @> x
+  return $ b @> x
 
 simplifyStandalone :: Expr -> SimplifyM Atom
 simplifyStandalone (Atom (LamVal b body)) = do
@@ -107,9 +104,9 @@ simplifyAtom atom = case atom of
     substEnv <- ask
     scope <- getScope
     case envLookup substEnv v of
-      Just x -> return $ deShadow x scope
+      Just x -> return x
       Nothing -> case envLookup scope v of
-        Just (_, info) -> case info of
+        Just (AtomBinderInfo _ info) -> case info of
           LetBound ann (Atom x) | ann /= NoInlineLet -> dropSub $ simplifyAtom x
           _ -> substBuilderR atom
         _   -> substBuilderR atom
@@ -193,7 +190,7 @@ simplifyLams numArgs lam = do
       return $ case result of
         Left  res -> (res, Nothing)
         Right (dat, (ctx, recon), atomf) ->
-          ( mkConsList $ (toList dat) ++ (toList ctx)
+          ( TupleVal $ (toList dat) ++ (toList ctx)
           , Just \vals -> do
              (datEls', ctxEls') <- splitAt (length dat) <$> unpackConsList vals
              let dat' = restructure datEls' dat
@@ -203,7 +200,7 @@ simplifyLams numArgs lam = do
     go n scope (Block Empty (Atom (Lam (Abs b (arr, body))))) = do
       b' <- mapM substBuilderR b
       buildLamAux b' (\x -> extendR (b@>x) $ substBuilderR arr) \x@(Var v) -> do
-        let scope' = scope <> v @> (varType v, LamBound (void arr))
+        let scope' = scope <> v @> AtomBinderInfo (varType v) (LamBound (void arr))
         extendR (b@>x) $ go (n-1) scope' body
     go n _ lam' = error $
       "Expected " <> show n <> "-arg lambda, got: " <> pprint lam'
@@ -213,7 +210,7 @@ defunBlock localScope block = do
   if isData (getType block)
     then Left <$> simplifyBlock block
     else do
-      (result, (localScope', decls)) <- builderScoped $ simplifyBlock block
+      (result, ((localScope',_), decls)) <- builderScoped $ simplifyBlock block
       mapM_ emitDecl decls
       Right <$> separateDataComponent (localScope <> localScope') result
 
@@ -342,7 +339,7 @@ simplifyExpr expr = case expr of
               buildNAbsAux bs' \xs -> do
                 ~(Right fac@(dat, (ctx, _), _)) <- extendR (newEnv bs' xs) $ defunBlock (boundVars bs') body
                 -- NB: The return value here doesn't really matter as we're going to replace it afterwards.
-                return (mkConsList $ toList dat ++ toList ctx, fac)
+                return (TupleVal $ toList dat ++ toList ctx, fac)
             -- Now that we know the exact set of values each case needs, ctxDef is a sum type
             -- that can encapsulate the necessary contexts.
             -- TODO: Handle dependency once separateDataComponent supports it
@@ -353,10 +350,10 @@ simplifyExpr expr = case expr of
             let alts'' = for (enumerate $ zip alts' facs) $
                   \(i, (Abs bs (Block decls _), (dat, (ctx, _), _))) ->
                     Abs bs $ Block decls $ Atom $
-                      PairVal (mkConsList $ toList dat) (DataCon ctxDef [] i $ toList ctx)
+                      PairVal (TupleVal $ toList dat) (DataCon ctxDef [] i $ toList ctx)
             -- Here, we emit the case expression and unpack the results. All the trees
             -- should be the same, so we just pick the first one.
-            let (datType, datTree) = (\(dat, _, _) -> (getType $ mkConsList $ toList dat, dat)) $ head facs
+            let (datType, datTree) = (\(dat, _, _) -> (getType $ TupleVal $ toList dat, dat)) $ head facs
             caseResult <- emit $ Case e' alts'' $ PairTy datType (TypeCon ctxDef [])
             (cdat, cctx) <- fromPair caseResult
             dat <- flip restructure datTree <$> unpackConsList cdat

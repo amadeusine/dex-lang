@@ -1261,6 +1261,7 @@ def copysign (a:Float) (b:Float) : Float =
 
 -- Todo: use IEEE floating-point builtins.
 infinity = 1.0 / 0.0
+%passes
 nan      = 0.0 / 0.0
 
 -- Todo: use IEEE floating-point builtins.
@@ -1691,6 +1692,7 @@ def atan_inner (x:Float) : Float =
 def min_and_max [Ord a] (x:a) (y:a) : (a & a) =
   select (x < y) (x, y) (y, x)  -- get both with one comparison.
 
+%passes
 def atan2 (y:Float) (x:Float) : Float =
   -- Based off of the Tensorflow implementation at
   -- github.com/tensorflow/mlir-hlo/blob/master/lib/

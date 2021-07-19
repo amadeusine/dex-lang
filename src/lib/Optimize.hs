@@ -26,14 +26,15 @@ optimizeModule = dceModule . inlineModule . narrowEffects . dceModule
 type DceM = State Scope
 
 dceModule :: Module -> Module
-dceModule (Module ir decls bindings) = flip evalState mempty $ do
-  newBindings <- traverse dceBinding bindings
-  modify (<> freeVars newBindings)
-  newDecls <- dceDecls decls
-  return $ Module ir newDecls newBindings
-  where
-    dceBinding (ty, LetBound ann expr) = (ty,) . LetBound ann <$> dceExpr expr
-    dceBinding b = return b
+dceModule = id
+-- dceModule (Module ir decls result) = flip evalState mempty $ do
+--   newBindings <- traverse dceBinding bindings
+--   modify (<> freeVars newBindings)
+--   newDecls <- dceDecls decls
+--   return $ Module ir newDecls newBindings
+--   where
+--     dceBinding (ty, LetBound ann expr) = (ty,) . LetBound ann <$> dceExpr expr
+--     dceBinding b = return b
 
 dceBlock :: Block -> DceM Block
 dceBlock (Block decls result) = do
@@ -89,9 +90,10 @@ inlineTraversalDef :: TraversalDef InlineM
 inlineTraversalDef = (inlineTraverseDecl, inlineTraverseExpr, traverseAtom inlineTraversalDef)
 
 inlineModule :: Module -> Module
-inlineModule m = transformModuleAsBlock inlineBlock (computeInlineHints m)
-  where
-    inlineBlock block = fst $ runSubstBuilder (traverseBlock inlineTraversalDef block) mempty
+inlineModule m = m
+-- inlineModule m = transformModuleAsBlock inlineBlock (computeInlineHints m)
+--   where
+--     inlineBlock block = fst $ runSubstBuilder (traverseBlock inlineTraversalDef block) mempty
 
 inlineTraverseDecl :: Decl -> InlineM SubstEnv
 inlineTraverseDecl decl = case decl of
@@ -110,7 +112,7 @@ inlineTraverseDecl decl = case decl of
         dropSub $ extendR (b@>x) $ do
           blockEnv <- traverseDeclsOpen substTraversalDef body
           extendR blockEnv $ inlineTraverseDecl $ Let letAnn letBinder result
-      _ -> (letBinder@>) <$> emitTo (binderNameHint letBinder) letAnn (App f x)
+      _ -> (letBinder@>) <$> withNameHint letBinder (emitAnn letAnn (App f x))
   _ -> traverseDecl inlineTraversalDef decl
 
 -- TODO: This is a bit overeager. We should count under how many loops are we.
@@ -143,94 +145,96 @@ inlineTraverseExpr expr = case expr of
 type InlineHintM = State (Env InlineHint)
 
 computeInlineHints :: Module -> Module
-computeInlineHints m@(Module _ _ bindings) =
-    transformModuleAsBlock (flip evalState bindingsNoInline . hintBlock) m
-  where
-    usedInBindings = filter (not . isGlobal) $ bindingsAsVars $ freeVars bindings
-    bindingsNoInline = newEnv usedInBindings (repeat NoInline)
+computeInlineHints = undefined
+-- computeInlineHints m@(Module _ _ bindings _) =
+--     transformModuleAsBlock (flip evalState bindingsNoInline . hintBlock) m
+--   where
+--     usedInBindings = filter (not . isGlobal) $ bindingsAsVars $ freeVars bindings
+--     bindingsNoInline = newEnv usedInBindings (repeat NoInline)
 
-    hintBlock (Block decls result) = do
-      result' <- hintExpr result  -- Traverse result before decls!
-      Block <$> hintDecls decls <*> pure result'
+--     hintBlock (Block decls result) = do
+--       result' <- hintExpr result  -- Traverse result before decls!
+--       Block <$> hintDecls decls <*> pure result'
 
-    hintDecls decls = do
-      let revDecls = reverse $ toList decls
-      revNewDecls <- mapM hintDecl revDecls
-      return $ toNest $ reverse $ revNewDecls
+--     hintDecls decls = do
+--       let revDecls = reverse $ toList decls
+--       revNewDecls <- mapM hintDecl revDecls
+--       return $ toNest $ reverse $ revNewDecls
 
-    hintDecl decl = case decl of
-      Let ann b expr -> go [b] expr $ Let ann . head
-      where
-        go bs expr mkDecl = do
-          void $ noInlineFree bs
-          bs' <- traverse hintBinder bs
-          forM_ bs $ modify . envDelete
-          mkDecl bs' <$> hintExpr expr
+--     hintDecl decl = case decl of
+--       Let ann b expr -> go [b] expr $ Let ann . head
+--       where
+--         go bs expr mkDecl = do
+--           void $ noInlineFree bs
+--           bs' <- traverse hintBinder bs
+--           forM_ bs $ modify . envDelete
+--           mkDecl bs' <$> hintExpr expr
 
-    hintExpr :: Expr -> InlineHintM Expr
-    hintExpr expr = case expr of
-      App (Var v) x  -> App  <$> (Var v <$ use v) <*> hintAtom x
-      App g x        -> App  <$> hintAtom g       <*> hintAtom x
-      Atom x         -> Atom <$> hintAtom x
-      Op  op         -> Op   <$> traverse hintAtom op
-      Hof hof        -> Hof  <$> traverse hintAtom hof
-      Case e alts ty -> Case <$> hintAtom e <*> traverse hintAlt alts <*> hintAtom ty
+--     hintExpr :: Expr -> InlineHintM Expr
+--     hintExpr expr = case expr of
+--       App (Var v) x  -> App  <$> (Var v <$ use v) <*> hintAtom x
+--       App g x        -> App  <$> hintAtom g       <*> hintAtom x
+--       Atom x         -> Atom <$> hintAtom x
+--       Op  op         -> Op   <$> traverse hintAtom op
+--       Hof hof        -> Hof  <$> traverse hintAtom hof
+--       Case e alts ty -> Case <$> hintAtom e <*> traverse hintAlt alts <*> hintAtom ty
 
-    hintAlt (Abs bs block) = Abs <$> traverse hintAbsBinder bs <*> hintBlock block
+--     hintAlt (Abs bs block) = Abs <$> traverse hintAbsBinder bs <*> hintBlock block
 
-    hintAtom :: Atom -> InlineHintM Atom
-    hintAtom atom = case atom of
-      -- TODO: Is it always ok to inline e.g. into a table lambda? Even if the
-      --       lambda indicates that the access pattern would be injective, its
-      --       body can still get instantiated multiple times!
-      Lam (Abs b (arr, block)) -> Lam <$> (Abs <$> hintAbsBinder b <*> ((arr,) <$> hintBlock block))
-      _ -> noInlineFree atom
+--     hintAtom :: Atom -> InlineHintM Atom
+--     hintAtom atom = case atom of
+--       -- TODO: Is it always ok to inline e.g. into a table lambda? Even if the
+--       --       lambda indicates that the access pattern would be injective, its
+--       --       body can still get instantiated multiple times!
+--       Lam (Abs b (arr, block)) -> Lam <$> (Abs <$> hintAbsBinder b <*> ((arr,) <$> hintBlock block))
+--       _ -> noInlineFree atom
 
-    use n = do
-      maybeHint <- gets $ (`envLookup` n)
-      let newHint = case maybeHint of
-                      Nothing -> CanInline
-                      Just _  -> NoInline
-      modify (<> (n @> newHint))
+--     use n = do
+--       maybeHint <- gets $ (`envLookup` n)
+--       let newHint = case maybeHint of
+--                       Nothing -> CanInline
+--                       Just _  -> NoInline
+--       modify (<> (n @> newHint))
 
-    hintBinder :: Binder -> InlineHintM Binder
-    hintBinder b = do
-      maybeHint <- gets $ (`envLookup` b)
-      case (b, maybeHint) of
-        (Bind v  , Just hint) -> return $ BindWithHint hint   v
-        (Bind v  , Nothing  ) -> return $ BindWithHint NoHint v -- TODO: Change to Ignore?
-        (Ignore _, Nothing  ) -> return b
-        (Ignore _, Just _   ) -> error "Ignore binder is not supposed to have any uses"
+--     hintBinder :: Binder -> InlineHintM Binder
+--     hintBinder b = do
+--       maybeHint <- gets $ (`envLookup` b)
+--       case (b, maybeHint) of
+--         (Bind v  , Just hint) -> return $ BindWithHint hint   v
+--         (Bind v  , Nothing  ) -> return $ BindWithHint NoHint v -- TODO: Change to Ignore?
+--         (Ignore _, Nothing  ) -> return b
+--         (Ignore _, Just _   ) -> error "Ignore binder is not supposed to have any uses"
 
-    hintAbsBinder :: Binder -> InlineHintM Binder
-    hintAbsBinder b = modify (envDelete b) >> traverse hintAtom b
+--     hintAbsBinder :: Binder -> InlineHintM Binder
+--     hintAbsBinder b = modify (envDelete b) >> traverse hintAtom b
 
-    noInlineFree :: HasVars a => a -> InlineHintM a
-    noInlineFree a = modify (<> (fmap (const NoInline) (freeVars a))) >> return a
+--     noInlineFree :: HasVars a => a -> InlineHintM a
+--     noInlineFree a = modify (<> (fmap (const NoInline) (freeVars a))) >> return a
 
 -- === effect narrowing ===
 -- We often annotate lambdas with way more effects than they really induce
 -- and this makes those annotations much more precise (but only on `for` expressions).
 
 narrowEffects :: Module -> Module
-narrowEffects m = transformModuleAsBlock narrowBlock m
-  where
-    narrowBlock block = fst $ runSubstBuilder (traverseBlock narrowingTraversalDef block) mempty
+narrowEffects m = m
+-- narrowEffects m = transformModuleAsBlock narrowBlock m
+--   where
+--     narrowBlock block = fst $ runSubstBuilder (traverseBlock narrowingTraversalDef block) mempty
 
-    narrowingTraversalDef :: TraversalDef SubstBuilder
-    narrowingTraversalDef = ( traverseDecl narrowingTraversalDef
-                            , traverseExpr narrowingTraversalDef
-                            , narrowAtom )
+--     narrowingTraversalDef :: TraversalDef SubstBuilder
+--     narrowingTraversalDef = ( traverseDecl narrowingTraversalDef
+--                             , traverseExpr narrowingTraversalDef
+--                             , narrowAtom )
 
-    narrowAtom :: Atom -> SubstBuilder Atom
-    narrowAtom atom = case atom of
-      Lam (Abs b (arr, body)) -> do
-          b' <- mapM (traverseAtom narrowingTraversalDef) b
-          ~lam@(Lam (Abs b'' (_, body''))) <-
-            buildDepEffLam b'
-              (\x -> extendR (b'@>x) (substBuilderR arr))
-              (\x -> extendR (b'@>x) (evalBlockE narrowingTraversalDef body))
-          return $ case arr of
-            PlainArrow _ -> Lam $ Abs b'' (PlainArrow (blockEffs body''), body'')
-            _            -> lam
-      _ -> traverseAtom narrowingTraversalDef atom
+--     narrowAtom :: Atom -> SubstBuilder Atom
+--     narrowAtom atom = case atom of
+--       Lam (Abs b (arr, body)) -> do
+--           b' <- mapM (traverseAtom narrowingTraversalDef) b
+--           ~lam@(Lam (Abs b'' (_, body''))) <-
+--             buildDepEffLam b'
+--               (\x -> extendR (b'@>x) (substBuilderR arr))
+--               (\x -> extendR (b'@>x) (evalBlockE narrowingTraversalDef body))
+--           return $ case arr of
+--             PlainArrow _ -> Lam $ Abs b'' (PlainArrow (blockEffs body''), body'')
+--             _            -> lam
+--       _ -> traverseAtom narrowingTraversalDef atom

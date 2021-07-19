@@ -94,7 +94,7 @@ toImpModule env backend cc entryName argBinders maybeDest block = do
   where
     inVarScope :: Scope  -- TODO: fix (shouldn't use UnitTy)
     inVarScope = binderScope <> destScope
-    binderScope = foldMap binderAsEnv $ fmap (fmap $ const (UnitTy, UnknownBinder)) argBinders
+    binderScope = foldMap binderAsEnv $ fmap (fmap $ const ImpBound) argBinders
     destScope = fromMaybe mempty $ fmap freeVars maybeDest
     initCtx = ImpCtx backend CPU TopLevel
 
@@ -102,10 +102,10 @@ requiredFunctions :: HasVars a => Scope -> a -> [(Name, Atom)]
 requiredFunctions scope expr =
   flip foldMap (transitiveClosure getParents immediateParents) \fname ->
     case scope ! fname of
-       (_, LetBound _ (Atom f)) -> [(fname, f)]
+       AtomBinderInfo _ (LetBound _ (Atom f)) -> [(fname, f)]
        -- we treat runtime-supplied global constants (e.g. the virtual stdout
        -- channel) as lambda-bound. TODO: consider a new annotation.
-       (_, LamBound _) -> []
+       AtomBinderInfo _ (LamBound _) -> []
        _ -> error "Shouldn't have other free variables left"
   where
     getParents :: Name -> [Name]
@@ -125,9 +125,9 @@ translateTopLevel topEnv (maybeDest, block) = do
   resultAtom <- destToAtom outDest
   -- Some names in topEnv refer to global constants, like the virtual stdout channel
   let vsOut = envAsVars $ freeVars resultAtom `envDiff` topEnv
-  let reconAtom = Abs (toNest $ [Bind (v:>ty) | (v:>(ty, _)) <- vsOut]) resultAtom
+  let reconAtom = Abs (toNest $ [Bind (v:>ty) | (v :> AtomBinderInfo ty _) <- vsOut]) resultAtom
   let resultIExprs = case maybeDest of
-        Nothing -> [IVar (v:>fromScalarType ty) | (v:>(ty, _)) <- vsOut]
+        Nothing -> [IVar (v:>fromScalarType ty) | (v :> AtomBinderInfo ty _) <- vsOut]
         Just _  -> []
   return (reconAtom, resultIExprs)
 
@@ -406,10 +406,10 @@ toImpHof env (maybeDest, hof) = do
       dest <- allocDest maybeDest resultTy
       buildKernel idxTy \LaunchInfo{..} buildBody -> do
         liftM (,()) $ buildBody \ThreadInfo{..} -> do
-          let threadBody = fst $ flip runSubstBuilder (freeVars fbody) $
+          let threadBody = fst $ runSubstBuilder (freeVars fbody) mempty $
                 buildLam (Bind $ "hwidx" :> threadRange) PureArrow \hwidx ->
                   appReduce fbody =<< (emitOp $ Inject hwidx)
-          let threadDest = Con $ TabRef $ fst $ flip runSubstBuilder (freeVars dest) $
+          let threadDest = Con $ TabRef $ fst $ runSubstBuilder (freeVars dest) mempty $
                 buildLam (Bind $ "hwidx" :> threadRange) TabArrow \hwidx ->
                   indexDest dest =<< (emitOp $ Inject hwidx)
           void $ toImpHof env (Just threadDest, For (RegularFor Fwd) threadBody)
@@ -444,7 +444,7 @@ toImpHof env (maybeDest, hof) = do
         thrAccsArr <- alloc $ TabTy (Ignore widIdxTy) $ TabTy (Ignore tidIdxTy) accTypes
         mappingKernelBody <- buildBody \ThreadInfo{..} -> do
           let TC (ParIndexRange _ gtid nthr) = threadRange
-          let tileDest = Con $ TabRef $ fst $ flip runSubstBuilder (freeVars mappingDest) $ do
+          let tileDest = Con $ TabRef $ fst $ runSubstBuilder (freeVars mappingDest) mempty $ do
                 buildLam (Bind $ "hwidx":>threadRange) TabArrow \hwidx -> do
                   indexDest mappingDest =<< (emitOp $ Inject hwidx)
           wgThrAccs <- destGet thrAccsArr =<< intToIndex widIdxTy wid
@@ -498,9 +498,8 @@ toImpHof env (maybeDest, hof) = do
           guardBlock firstThread $
             copyAtom resDest =<< destToAtom =<< destGet arrDest =<< intToIndex arrIdxTy tid
         combineWithDest :: Dest -> Atom -> ImpM ()
-        combineWithDest accsDest accsUpdates = do
+        combineWithDest accsDest ~(TupleVal accsUpdatesList) = do
           let accsDestList = fromDestConsList accsDest
-          let Right accsUpdatesList = fromConsList accsUpdates
           forM_ (zip3 accsDestList baseMonoids accsUpdatesList) $ \(dest, bm, update) -> do
             extender <- fromBuilder $ mextendForRef dest bm update
             void $ toImpOp (Nothing, PrimEffect dest $ MExtend extender)
@@ -669,7 +668,7 @@ makeBaseTypePtr :: BaseType -> DestM Atom
 makeBaseTypePtr ty = do
   DestEnv allocInfo idxs _ <- ask
   numel <- buildScoped $ elemCountE idxs
-  ptrScope <- fmap (const (UnitTy, UnknownBinder)) <$> look
+  ptrScope <- fmap (const $ ImpBound) <$> look
   scope <- getScope
   -- We use a different namespace because these will be hoisted to the top
   -- where they could cast shadows
@@ -693,7 +692,7 @@ makeDataConDest Empty = return Empty
 makeDataConDest (Nest b rest) = do
   let ty = binderAnn b
   dest <- makeDestRec ty
-  v <- freshVarE UnknownBinder b  -- TODO: scope names more carefully
+  v <- withNameHint b $ freshVarE UnknownBinder ty  -- TODO: scope names more carefully
   rest'  <- substBuilder (b @> Var v) rest
   rest'' <- withDepVar (Bind v) $ makeDataConDest rest'
   return $ Nest (DataConRefBinding (Bind v) dest) rest''
@@ -949,7 +948,7 @@ splitDest (maybeDest, (Block decls ans)) = do
 
         -- TODO: Think hard about scoping (in both runBuilder and buildLam)!!!
         adaptDest :: [Binder] -> [Atom] -> Maybe Dest
-        adaptDest loopBinders indices = fst <$> runBuilderT (go mempty indices) mempty
+        adaptDest loopBinders indices = fst <$> runBuilderT mempty mempty (go mempty indices)
           where
             go :: Env Atom -> [Atom] -> BuilderT Maybe Dest
             go env [] = do
@@ -1050,7 +1049,7 @@ toScalarType b = BaseTy b
 fromBuilder :: Subst a => Builder a -> ImpM a
 fromBuilder m = do
   scope <- variableScope
-  let (ans, (_, decls)) = runBuilder m scope
+  let (ans, (_, decls)) = runBuilder scope mempty m
   env <- catFoldM translateDecl mempty $ fmap (Nothing,) decls
   impSubst env ans
 
@@ -1252,7 +1251,7 @@ freshVar :: VarP a -> ImpM (VarP a)
 freshVar (hint:>t) = do
   scope <- looks envScope
   let v = genFresh (rawName GenName $ nameTag hint) scope
-  extend $ mempty { envScope = v @> (UnitTy, UnknownBinder) }
+  extend $ mempty { envScope = v @> ImpBound }
   return $ v:>t
 
 withLevel :: ParallelismLevel -> ImpM a -> ImpM a
@@ -1271,16 +1270,16 @@ type ImpCheckM a = StateT (Env ()) (ReaderT (Env IType, Device) (Either Err)) a
 
 instance Checkable ImpModule where
   -- TODO: check main function defined
-  checkValid (ImpModule fs) = mapM_ checkValid fs
+  checkValid scope (ImpModule fs) = mapM_ (checkValid scope) fs
 
 instance Checkable ImpFunction where
-  checkValid f@(ImpFunction (_:> IFunType cc _ _) bs block) = addContext ctx $ do
+  checkValid _ f@(ImpFunction (_:> IFunType cc _ _) bs block) = addContext ctx $ do
     let scope = foldMap (binderAsEnv . fmap (const ())) bs
     let env   = foldMap (binderAsEnv                  ) bs
     void $ flip runReaderT (env, deviceFromCallingConvention cc) $
       flip runStateT scope $ checkBlock block
     where ctx = "Checking:\n" ++ pprint f
-  checkValid (FFIFunction _) = return ()
+  checkValid _ (FFIFunction _) = return ()
 
 checkBlock :: ImpBlock -> ImpCheckM [IType]
 checkBlock (ImpBlock Empty val) = mapM checkIExpr val

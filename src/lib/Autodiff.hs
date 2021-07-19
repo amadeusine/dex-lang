@@ -43,7 +43,7 @@ type TangentM = ReaderT TangentEnv Builder
 newtype LinA a = LinA { runLinA :: PrimalM (a, TangentM a) }
 
 linearize :: Scope -> Atom -> Atom
-linearize scope ~(Lam (Abs b (_, block))) = fst $ flip runBuilder scope $ do
+linearize scope ~(Lam (Abs b (_, block))) = fst $ runBuilder scope mempty $ do
   checkBuilder =<< buildLam b PureArrow \x@(Var v) -> do
     (y, yt) <- flip runReaderT (DerivWrt (varAsEnv v) []) $ runLinA $ linearizeBlock (b@>x) block
     -- TODO: check linearity
@@ -514,7 +514,7 @@ instance Monoid TransposeEnv where
 type TransposeM a = ReaderT TransposeEnv Builder a
 
 transpose :: Scope -> Atom -> Atom
-transpose scope ~(Lam (Abs b (_, block))) = fst $ flip runBuilder scope $ do
+transpose scope ~(Lam (Abs b (_, block))) = fst $ runBuilder scope mempty $ do
   checkBuilder =<< buildLam (Bind $ "ct" :> getType block) LinArrow \ct -> do
     snd <$> (flip runReaderT mempty $ withLinVar b $ transposeBlock block ct)
 

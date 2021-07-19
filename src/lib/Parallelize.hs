@@ -37,8 +37,7 @@ asABlock :: Block -> ABlock
 asABlock block = ABlock decls result
   where
     scope = freeVars block
-    ((result, decls), _) = flip runBuilder scope $ scopedDecls $ emitBlock block
-
+    ((result, decls), _) = runBuilder scope mempty $ scopedDecls $ emitBlock block
 
 data LoopEnv = LoopEnv
   { loopBinders :: [Var]              -- In scope of the original program
@@ -54,8 +53,9 @@ runLoopM :: LoopM a -> TLParallelM a
 runLoopM m = runReaderT m $ LoopEnv mempty mempty
 
 extractParallelism :: Module -> Module
-extractParallelism = transformModuleAsBlock go
-  where go block = fst $ evalState (runSubstBuilderT (traverseBlock parallelTrav block) mempty) $ AccEnv mempty
+extractParallelism = id
+-- extractParallelism = transformModuleAsBlock go
+--   where go block = fst $ evalState (runSubstBuilderT (traverseBlock parallelTrav block) mempty) $ AccEnv mempty
 
 parallelTrav :: TraversalDef TLParallelM
 parallelTrav = ( traverseDecl parallelTrav
@@ -181,7 +181,7 @@ withLoopBinder :: Binder -> LoopM a -> LoopM a
 withLoopBinder b m = do
   v <- case b of
     Bind v    -> return v
-    Ignore ty -> freshVarE UnknownBinder $ Bind $ (Name LoopBinderName "i" 0) :> ty
+    Ignore ty -> withNameHint ("i"::String) $ freshVarE UnknownBinder ty
   local (\env -> env { loopBinders = loopBinders env <> [v]}) m
 
 delayApps :: Env (Atom, [Atom]) -> LoopM a -> LoopM a
